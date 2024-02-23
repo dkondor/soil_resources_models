@@ -1,17 +1,40 @@
 /*
  * pop_model1.cpp -- numerically solve analytic population models with
- * 	two components
+ * 	two components, models used in the paper (in all cases, both 
+ * 	logistic and linear resource regrowth variants)
  * 
- * Note: the GSL library is used for calculating numerical solutions;
- * see general info here:
- * https://www.gnu.org/software/gsl/
- * and the documentation on ODE solvers here:
- * https://www.gnu.org/software/gsl/doc/html/ode-initval.html
+ * 1. Volterra: VOLTERRA_LIN, VOLTERRA_LOG
+ * 2. Volterra, logistic consumers (farmer-soil model): SOIL_LIN, SOIL_LOG
+ * 3. Rosenzweig-MacArthur: RMA_LIN, RMA_LOG
+ * 4. Ratio-dependent: RATIO_LIN, RATIO_LOG
+ * 5. Warfare model (Turchin-Korotayev): TURCHIN
  * 
- * Typical compilation (on Linux, with GSL installed system-wide):
-g++ -o pm1 pop_model1.cpp -lgsl -lgslcblas -O3 -march=native -lm
+ * Copyright 2023 Daniel Kondor <kondor@csh.ac.at>
  * 
- * Copyright 2022 Daniel Kondor <kondor@csh.ac.at>
+ * This is free and unencumbered software released into the public domain.
+ * 
+ * Anyone is free to copy, modify, publish, use, compile, sell, or
+ * distribute this software, either in source code form or as a compiled
+ * binary, for any purpose, commercial or non-commercial, and by any
+ * means.
+ * 
+ * In jurisdictions that recognize copyright laws, the author or authors
+ * of this software dedicate any and all copyright interest in the
+ * software to the public domain. We make this dedication for the benefit
+ * of the public at large and to the detriment of our heirs and
+ * successors. We intend this dedication to be an overt act of
+ * relinquishment in perpetuity of all present and future rights to this
+ * software under copyright law.
+ * 
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+ * IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+ * OTHER DEALINGS IN THE SOFTWARE.
+ * 
+ * For more information, please refer to <https://unlicense.org>
  * 
  */
 
@@ -30,14 +53,19 @@ g++ -o pm1 pop_model1.cpp -lgsl -lgslcblas -O3 -march=native -lm
 struct params {
 	enum class type {
 		NO_TYPE,
-		LOGISTIC, /* logistic growth with no resources */
-		LV, /* Lotka-Volterra model */
-		TURCHIN, /* Turchin-Korotayev model of population and warfare (Model IV) */
-		BT, /* Volterra model (Model I) */
-		BT_LIN, /* Volterra model with linear resource renewal (Model II) */
-		SOIL1, /* simple version of the soil model with resource depletion independent of resource levels (not used) */
-		SOIL2, /* soil model (Model III in the SI) with resource depletion proportional to both resources and population */
-		SOIL_M, /* soil model with manuring / other input proportional to population */
+		TURCHIN,
+		VOLTERRA_LOG,
+		VOLTERRA_LIN,
+		SOIL_LOG,
+		SOIL_LIN,
+		RMA_LOG, /* Rosenzweig-MacArthur */
+		RMA_LIN, /* same with linear resource regrowth */
+		RMA_LOG_LOG, /* Rosenzweig-MacArthur-like model with logistic consumers */
+		RMA_LOG_LIN, /* same with linear resource regrowth */
+		RATIO_LIN, /* ratio dependent functional response, symmetric */
+		RATIO_LOG, /* ratio dependent functional response, logistic resources, symmetric */
+		LRATIO_LIN, /* ratio dependent functional response, logistic consumers */
+		LRATIO_LOG /* ratio dependent functional response, logistic consumers + resources */
 	};
 	type t = type::NO_TYPE;
 	double r = 0.01;
@@ -46,73 +74,80 @@ struct params {
 	double b = 0.01;
 	double c = 0.01;
 	double d = 0.01;
-	double e = 0.01;
+	double g = 0.5;
+	double E = 0.0; // constant influx of resources (logistic ratio-dep. model)
+	double xmin = 0.0; // do not let x or y fall below this value (if > 0.0)
+	double ymin = 0.0;
 	
 	static bool try_parse_type(const char* x, type& t) {
 		if(!x) return false;
 		
-		if(x[0] == 'l' || x[0] == 'L') {
-			if(x[1] == 'o' || x[1] == 'O') {
-				if(x[2] == 'g' || x[2] == 'G') {
-					t = type::LOGISTIC;
-					return true;
+		switch(x[0]) {
+			case 't':
+			case 'T':
+				t = type::TURCHIN;
+				return true;
+			case 's':
+			case 'S':
+				if(x[1] == 'l' || x[1] == 'L') t = type::SOIL_LOG;
+				else t = type::SOIL_LIN;
+				return true;
+			case 'v':
+			case 'V':
+				if(x[1] == 'l' || x[1] == 'L') t = type::VOLTERRA_LOG;
+				else t = type::VOLTERRA_LIN;
+				return true;
+			case 'r':
+			case 'R':
+				switch(x[1]) {
+					case 'm':
+					case 'M':
+						if(x[2] == 'l' || x[2] == 'L') t = type::RMA_LOG;
+						else if (x[2] == 0) t = type::RMA_LIN;
+						else return false;
+						return true;
+					case 'l':
+					case 'L':
+						t = type::RATIO_LOG;
+						return true;
+					case 0:
+						t = type::RATIO_LIN;
+						return true;
+					default:
+						return false;
 				}
-				if(x[2] == 't' || x[2] == 'T') {
-					t = type::LV;
-					return true;
+			case 'l':
+			case 'L':
+				switch(x[1]) {
+					case 'l':
+					case 'L':
+						t = type::LRATIO_LOG;
+						return true;
+					case 'r':
+					case 'R':
+						if(x[2] == 'l' || x[2] == 'L') t = type::RMA_LOG_LOG;
+						else if (x[2] == 0) t = type::RMA_LOG_LIN;
+						else return false;
+						return true;
+					case 0:
+						t = type::LRATIO_LIN;
+						return true;
+					default:
+						return false;
 				}
-			}
-			if(x[1] == 'v' || x[1] == 'V') {
-				t = type::LV;
-				return true;
-			}
-			return false;
-		}
-		
-		if(x[0] == 't' || x[1] == 'T') {
-			t = type::TURCHIN;
-			return true;
-		}
-		
-		if(x[0] == 'b' || x[0] == 'B') {
-			if(x[1] == 't' || x[1] == 'T') switch(x[2]) {
-				case 'e':
-				case 'E':
-					t = type::BT_LIN;
-					return true;
-				case 0:
-					t = type::BT;
-					return true;
-				default:
-					return false;
-			}
-			return false;
-		}
-		
-		if(x[0] == 's' || x[0] == 'S') switch(x[1]) {
-			case '1':
-				t = type::SOIL1;
-				return true;
-			case '2':
-				t = type::SOIL2;
-				return true;
-			case 'm':
-				t = type::SOIL_M;
-				return true;
 			default:
 				return false;
 		}
-		
-		return false;
 	}
 	
 	// return if x should be limited to strictly below K
 	static bool limit_x(type t) {
 		switch(t) {
 			case type::TURCHIN:
-			case type::SOIL1:
-			case type::SOIL2:
-			case type::SOIL_M:
+			case type::SOIL_LOG:
+			case type::SOIL_LIN:
+			case type::LRATIO_LIN:
+			case type::LRATIO_LOG:
 				return true;
 			default:
 				return false;
@@ -123,11 +158,16 @@ struct params {
 	// return if y should be limited to strictly below K
 	static bool limit_y(type t) {
 		switch(t) {
-			case type::BT:
-			case type::BT_LIN:
-			case type::SOIL1:
-			case type::SOIL2:
-			case type::SOIL_M:
+			case type::VOLTERRA_LOG:
+			case type::VOLTERRA_LIN:
+			case type::SOIL_LOG:
+			case type::SOIL_LIN:
+			case type::RMA_LOG:
+			case type::RMA_LIN:
+			case type::RATIO_LIN:
+			case type::RATIO_LOG:
+			case type::LRATIO_LIN:
+			case type::LRATIO_LOG:
 				return true;
 			default:
 				return false;
@@ -138,30 +178,50 @@ struct params {
 	// get the value of the stationary solution
 	void get_sol(double x[2]) const {
 		switch(t) {
-			case type::LOGISTIC:
-				x[0] = K;
-				x[1] = 0.0;
-				break;
-			case type::BT:
+			case type::VOLTERRA_LOG:
 				x[0] = c * K * ( 1.0 - d / b) / a;
 				x[1] = d * K / b;
 				break;
-			case type::BT_LIN:
+			case type::VOLTERRA_LIN:
 				x[0] = c * K * ( b / d - 1.0) / a;
 				x[1] = d * K / b;
 				break;
-			case type::SOIL2:
-				x[0] = K * c * (sqrt(1.0 + 4.0*a/c) - 1.0) / (2.0 * a);
+			case type::SOIL_LOG:
+				x[0] = c * K / (a + c);
 				x[1] = x[0];
 				break;
-			case type::SOIL_M:
-				x[0] = K * ( e - c + sqrt( (e + c)*(e + c) + 4.0 * a * c) ) / (2.0 * (a + e));
+			case type::SOIL_LIN:
+				x[0] = K * c * (sqrt(1.0 + 4.0*a/c) - 1.0) / (2.0 * a);
 				x[1] = x[0];
 				break;
 			case type::TURCHIN:
 				x[0] = 0.5 * b * r * (sqrt(1.0 + 4.0*a / (b*r)) - 1) / a;
 				x[1] = r * (1.0 - x[0]);
 				x[0] *= K;
+				break;
+			case type::RMA_LOG:
+			case type::RMA_LIN:
+				x[1] = K * d / (b - d * g);
+				x[0] = K * (c * b / a) * (b - (1.0 + g) * d) / (b - g * d);
+				if(t == type::RMA_LOG) x[0] /= (b - g * d);
+				else x[0] /= d;
+				break;
+			case type::RATIO_LIN:
+				x[1] = c * K / (c + a - a * g * d / b);
+				x[0] = x[1] * (b / d - g);
+				break;
+			case type::RATIO_LOG:
+				//!! TODO: E term is not taken into account here!
+				x[1] = K * (1.0 - (a / c) * (1 - d * g / b));
+				x[0] = x[1] * (b / d - g);
+				break;
+			case type::LRATIO_LIN:
+				x[1] = K * c * (1.0 + g) / (a + c * (1.0 + g));
+				x[0] = x[1];
+				break;
+			case type::LRATIO_LOG:
+				x[1] = K * (1.0 - (a / c) * 1.0 / (1.0 + g));
+				x[0] = x[1];
 				break;
 			default:
 				throw std::runtime_error("Stationary solution not implemented for the requested model type!\n");
@@ -181,13 +241,19 @@ struct params {
 		double tmp1;
 		double scale;
 		switch(t) {
-			case type::BT:
+			case type::VOLTERRA_LOG:
 				tmp1 = c * d / b;
 				x[0] = -0.5 * tmp1;
 				tmp1 = tmp1 * tmp1 - 4 * tmp1 * (b - d);
 				scale = 0.5;
 				break;
-			case type::SOIL2:
+			case type::SOIL_LOG:
+				tmp1 = r + c*c / (a + c);
+				x[0] = -1.0 * tmp1 / 2.0;
+				tmp1 = tmp1 * tmp1 - 4 * r * c;
+				scale = 0.5;
+				break;
+			case type::SOIL_LIN:
 				{
 					double xs = c * (sqrt(1.0 + 4.0*a/c) - 1.0) / (2.0 * a);
 					tmp1 = -r - c - a * xs;
@@ -196,7 +262,7 @@ struct params {
 					scale = 0.5;
 				}
 				break;
-			case type::BT_LIN:
+			case type::VOLTERRA_LIN:
 				tmp1 = b * c / d;
 				x[0] = -1.0 * tmp1 / 2.0;
 				tmp1 = tmp1 * tmp1 - 4.0 * c * (b - d);
@@ -211,6 +277,74 @@ struct params {
 					scale = 0.5;
 					break;
 				}
+			case type::RATIO_LIN:
+				{
+					double tmp2 = (b - g * d) / (b * d);
+					double aa = a * tmp2;
+					// double bb = b * tmp2;
+					double cc = c * tmp2;
+					double dd = d * tmp2;
+					double B1 = (aa + 1) * dd * dd + cc;
+					double C1 = cc * dd * dd + aa * dd * dd * dd;
+					x[0] = -0.5 * B1;
+					tmp1 = B1 * B1 - 4.0 * C1;
+					scale = 0.5;
+					break;
+				}
+			case type::RATIO_LOG:
+				{
+					//!! TODO: E term is not taken into account here!
+					double tmp2 = (b - g * d) / (b * d);
+					double aa = a * tmp2;
+					// double bb = b * tmp2;
+					double cc = c * tmp2;
+					double dd = d * tmp2;
+					// double gg = d * e / (b - d * e);
+					double B1 = (aa + 1) * dd * dd + cc - 2 * aa * dd;
+					double C1 = cc * dd * dd - aa * dd * dd * dd;
+					x[0] = -0.5 * B1;
+					tmp1 = B1 * B1 - 4.0 * C1;
+					scale = 0.5;
+					break;
+				}
+			case type::RMA_LIN:
+				{
+					double x1 = d / (b - d * g);
+					double B = c * (1.0 + (1.0 - x1) / (x1 * (1.0 + g * x1)) );
+					double C = c * d * (1.0 - x1) / (x1 * (1.0 + g * x1));
+					x[0] = -0.5 * B;
+					tmp1 = B * B - 4.0 * C;
+					scale = 0.5;
+				}
+				break;
+			case type::RMA_LOG:
+				{
+					double x1 = d / (b - d * g);
+					double B = c * ((1.0 - x1) / (1.0 + g * x1) + 2.0 * x1 - 1.0);
+					double C = c * d * (1.0 - x1) / (1.0 + g * x1);
+					x[0] = -0.5 * B;
+					tmp1 = B * B - 4.0 * C;
+					scale = 0.5;
+				}
+				break;
+			case type::LRATIO_LIN:
+				{
+					double TrJ = -1.0 * r - c - a / ((1.0 + g)*(1.0 + g));
+					double DetJ = r * (c + a / (1.0 + g));
+					x[0] = 0.5 * TrJ;
+					tmp1 = TrJ * TrJ - 4.0 * DetJ;
+					scale = 0.5;
+				}
+				break;
+			case type::LRATIO_LOG:
+				{
+					double TrJ = -1.0 * r - c - a / ((1.0 + g)*(1.0 + g)) + 2.0 * a / (1.0 + g);
+					double DetJ = r * (c - a / (1.0 + g));
+					x[0] = 0.5 * TrJ;
+					tmp1 = TrJ * TrJ - 4.0 * DetJ;
+					scale = 0.5;
+				}
+				break;
 			default:
 				throw std::runtime_error("Jacobian eigenvalues not implemented for the requested model type!\n");
 		}
@@ -224,17 +358,15 @@ struct params {
 	}
 	
 	/* print (the beginning) of a file header with the names of important parameters */
-	void print_header(FILE* f, char sep, bool newline = false)  const {
+	void print_header(FILE* f, char sep, bool newline = false) const {
 		switch(t) {
-			case type::BT:
-			case type::BT_LIN:
+			case type::VOLTERRA_LOG:
+			case type::VOLTERRA_LIN:
 				fprintf(f, "a%1$cb%1$cc%1$cd%1$cr%1$cK", sep);
 				break;
-			case type::SOIL2:
+			case type::SOIL_LOG:
+			case type::SOIL_LIN:
 				fprintf(f, "a%1$cc%1$cr%1$cK", sep);
-				break;
-			case type::SOIL_M:
-				fprintf(f, "a%1$cc%1$cr%1$ce%1$cK", sep);
 				break;
 			default:
 				throw std::runtime_error("Parameter output not implemented for the requested model type!\n");
@@ -244,17 +376,15 @@ struct params {
 	}
 	
 	/* print the current value of parameters that are used by the current model */
-	void print_pars(FILE* f, char sep, bool newline = false)  const {
+	void print_pars(FILE* f, char sep, bool newline = false) const {
 		switch(t) {
-			case type::BT:
-			case type::BT_LIN:
+			case type::VOLTERRA_LOG:
+			case type::VOLTERRA_LIN:
 				fprintf(f,"%2$f%1$c%3$f%1$c%4$f%1$c%5$f%1$c%6$f%1$c%7$f", sep, a, b, c, d, r, K);
 				break;
-			case type::SOIL2:
+			case type::SOIL_LOG:
+			case type::SOIL_LIN:
 				fprintf(f,"%2$f%1$c%3$f%1$c%4$f%1$c%5$f", sep, a, c, r, K);
-				break;
-			case type::SOIL_M:
-				fprintf(f,"%2$f%1$c%3$f%1$c%4$f%1$c%5$f%1$c%6$f", sep, a, c, r, e, K);
 				break;
 			default:
 				throw std::runtime_error("Parameter output not implemented for the requested model type!\n");
@@ -265,16 +395,26 @@ struct params {
 	
 	
 	/* set the a parameter automatically based on the values of b, c, d
-	 * in the case of the Volterra model and its linear variant */
+	 * in the case of the Volterra and RMA model variants */
 	void set_auto_a() {
 		switch(t) {
-			case type::BT:
+			case type::VOLTERRA_LOG:
 				a = (1.0 - d / b) * c * b / d;
 				r = b - d;
 				break;
-			case type::BT_LIN:
+			case type::VOLTERRA_LIN:
 				a = (1.0 - d / b) * c * b * b / d / d;
 				r = b - d;
+				break;
+			case type::RMA_LOG:
+				r = (b / (g + 1.0) - d);
+				if(r < 0.0) throw std::runtime_error("set_auto_a(): parameters are out of range!\n");
+				a = c * ( (g + 1.0) * (g + 1.0) * (r + d) * r ) / (d * d + d * (g + 1.0) * r);
+				break;
+			case type::RMA_LIN:
+				r = (b / (g + 1.0) - d);
+				if(r < 0.0) throw std::runtime_error("set_auto_a(): parameters are out of range!\n");
+				a = c * r * (r + d) * (1.0 + g) * (1.0 + g) / d / d;
 				break;
 			default:
 				throw std::runtime_error("Auto-adjustment of the a parameter is not supported for this model variant!\n");
@@ -282,77 +422,111 @@ struct params {
 	}
 	
 	/* set the b and d parameters automatically based on the values of a, c, r
-	 * in the case of the Volterra model and its linear variant */
+	 * in the case of the Volterra model, the RMA model and their linear variants */
 	void set_auto_bd() {
 		switch(t) {
-			case type::BT:
+			case type::VOLTERRA_LOG:
 				d = r * c / a;
 				b = d + r;
 				break;
-			case type::BT_LIN:
+			case type::VOLTERRA_LIN:
 				d = 0.5 * c * r * (1.0 + sqrt(1 + 4.0*a/c)) / a;
 				b = a*d*d/c/r;
+				break;
+			case type::RMA_LOG:
+				{
+					double tmp1 = (g + 1.0)*(g + 1.0) * c / a;
+					double tmp2 = tmp1 - (g + 1.0);
+					double tmp3 = tmp2*tmp2 + 4.0*tmp1;
+					double tmp4 = 0.5 * (tmp2 + sqrt(tmp3));
+					d = tmp4 * r;
+					b = (r + d) * (g + 1.0);
+				}
+				break;
+			case type::RMA_LIN:
+				{
+					double tmp1 = (g + 1.0)*(g + 1.0) * c / a;
+					double tmp2 = 0.5 * (tmp1 + sqrt(tmp1*tmp1 + 4.0*tmp1));
+					d = tmp2 * r;
+					b = (r + d) * (g + 1.0);
+				}
 				break;
 			default:
 				throw std::runtime_error("Auto-adjustment of the b and d parameters is not supported for this model variant!\n");
 		}
 	}
-};
 
-
-/* calculate the derivatives */
-int dfunc2(double t, const double y1[], double dydt[], const params& pars) {
-	double x = y1[0];
-	double y = y1[1];
-	
-	switch(pars.t) {
-		case params::type::LOGISTIC:
-			dydt[0] = pars.r * x * (1 - x / pars.K);
-			dydt[1] = 0.0;
-			break;
-		case params::type::LV:
-			dydt[0] = pars.r * x - pars.d * x * y;
-			dydt[1] = pars.a * x * y - pars.b * y;
-			break;
-		case params::type::TURCHIN:
-			dydt[0] = pars.r * x * (1 - x / pars.K) - pars.c * x * y; // note: could be c * x * y
-			dydt[1] = pars.a * x * x / (pars.K * pars.K) - pars.b * y;
-			break;
-		case params::type::BT:
-			dydt[0] = -1.0 * pars.d * x + pars.b * x * y / pars.K;
-			dydt[1] = pars.c * y * (1 - y / pars.K) - pars.a * x * y / pars.K;
-			break;
-		case params::type::BT_LIN:
-			dydt[0] = -1.0 * pars.d * x + pars.b * x * y / pars.K;
-			dydt[1] = pars.c * (pars.K - y) - pars.a * x * y / pars.K;
-			break;
-		case params::type::SOIL1:
-			dydt[0] = pars.r * x * (1 - x / y);
-			dydt[1] = pars.c * (pars.K - y) - pars.a * x;
-			break;
-		case params::type::SOIL2:
-			dydt[0] = pars.r * x * (1 - x / y);
-			dydt[1] = pars.c * (pars.K - y) - pars.a * x * y / pars.K;
-			break;
-		case params::type::SOIL_M:
-			dydt[0] = pars.r * x * (1 - x / y);
-			dydt[1] = (pars.c + pars.e * x / pars.K) * (pars.K - y) - pars.a * x * y / pars.K;
-			break;
-		default:
-			return GSL_EBADFUNC;
+	int dfunc(double t, const double y1[], double dydt[]) const {
+		double x = y1[0];
+		double y = y1[1];
+		
+		switch(this->t) {
+			case params::type::TURCHIN:
+				dydt[0] = r * x * (1 - x / K) - c * x * y; // x: population
+				dydt[1] = a * x * x / (K * K) - b * y; // y: warfare level
+				break;
+			case params::type::VOLTERRA_LIN:
+				dydt[0] = -1.0 * d * x + b * x * y / K; // x: population
+				dydt[1] = c * (K - y) - a * x * y / K; // y: resource level
+				break;
+			case params::type::VOLTERRA_LOG:
+				dydt[0] = -1.0 * d * x + b * x * y / K; // x: population
+				dydt[1] = c * y * (1 - y / K) - a * x * y / K; // y: resource level
+				break;
+			case params::type::SOIL_LIN:
+				dydt[0] = r * x * (1 - x / y); // x: population
+				dydt[1] = c * (K - y) - a * x * y / K; // y: resource level
+				break;
+			case params::type::SOIL_LOG:
+				dydt[0] = r * x * (1 - x / y); // x: population
+				dydt[1] = c * y * (1 - y / K) - a * x * y / K; // y: resource level
+				break;
+			case params::type::RMA_LIN:
+				dydt[0] = -1.0 * d * x + b * x * y / (K + g * y); // x: population
+				dydt[1] = c * (K - y) - a * x * y / (K + g * y); // y: resource level
+				break;
+			case params::type::RMA_LOG:
+				dydt[0] = -1.0 * d * x + b * x * y / (K + g * y); // x: population
+				dydt[1] = c * y * (1 - y / K) - a * x * y / (K + g * y); // y: resource level
+				break;
+			case params::type::RMA_LOG_LIN:
+				dydt[0] = r * x * (1 - x / y); // x: population
+				dydt[1] = c * (K - y) - a * x * y / (K + g * y); // y: resource level
+				break;
+			case params::type::RMA_LOG_LOG:
+				dydt[0] = r * x * (1 - x / y); // x: population
+				dydt[1] = c * y * (1 - y / K) - a * x * y / (K + g * y); // y: resource level
+				break;
+			case params::type::RATIO_LIN:
+				dydt[0] = b * x * y / (x + g * y) - d * x; // x: population
+				dydt[1] = c * (K - y) - a * x * y / (x + g * y); // y: resource level
+				break;
+			case params::type::RATIO_LOG:
+				dydt[0] = b * x * y / (x + g * y) - d * x; // x: population
+				dydt[1] = c * y * (1.0 - y / K) - a * x * y / (x + g * y) + E; // y: resource level
+				break;
+			case params::type::LRATIO_LIN:
+				dydt[0] = r * x * (1 - x / y); // x: population
+				dydt[1] = c * (K - y) - a * x * y / (x + g * y); // y: resource level
+				break;
+			case params::type::LRATIO_LOG:
+				dydt[0] = r * x * (1 - x / y); // x: population
+				dydt[1] = c * y * (1.0 - y / K) - a * x * y / (x + g * y) + E; // y: resource level
+				break;
+			default:
+				return GSL_EBADFUNC;
+		}
+		
+		return GSL_SUCCESS;
 	}
-	
-	return GSL_SUCCESS;
-}
+};
 
 int dfunc(double t, const double y1[], double dydt[], void* params1) {
 	const params& pars = *(const params*)params1;
-	return dfunc2(t, y1, dydt, pars);
+	return pars.dfunc(t, y1, dydt);
 }
 
 
-/* get which "segment" of the phase space we are based on the sign of
- * the derivatives */
 int get_segment(double dydt[2]) {
 	const double eps = 1e-15;
 	if(fabs(dydt[0]) < eps || fabs(dydt[1]) < eps) return 0;
@@ -392,7 +566,7 @@ int do_one_run(const params& pars, const double y0[2], double tmax, double dt, b
 	if(fout) fprintf(fout, "%f\t%f\t%f\n", t, y1[0], y1[1]);
 	
 	// keep track of the derivatives in dydt
-	dfunc2(t, y1, dydt, pars);
+	pars.dfunc(t, y1, dydt);
 	
 	// calculate the eigenvalues of the Jacobian at the stationary solution if needed
 	double j1[2];
@@ -414,6 +588,8 @@ int do_one_run(const params& pars, const double y0[2], double tmax, double dt, b
 		if(!cycles_summary)
 			fprintf(stderr, "%f\t%f\t%f\t%f\n", j1[0], j1[1], ys[0], ys[1]);
 	}
+	
+	bool need_reset = false;
 	
 	while(tmax > 0.0 && t < tmax) {
 		// add noise sampled from a Gaussian to either or both variables
@@ -440,13 +616,22 @@ int do_one_run(const params& pars, const double y0[2], double tmax, double dt, b
 			t += dt;
 		}
 		else {
-			if(noise_x > 0.0 || noise_y > 0.0) gsl_odeiv2_driver_reset(d);
+			if(noise_x > 0.0 || noise_y > 0.0) need_reset = true;
+			if(need_reset) { gsl_odeiv2_driver_reset(d); need_reset = false; }
 			double t1 = t + dt;
 			int r = gsl_odeiv2_driver_apply(d, &t, t1, y1);
 			if(r != GSL_SUCCESS) {
 				fprintf(stderr, "Error advancing the solution (%d)!\n", r);
 				gsl_odeiv2_driver_free(d);
 				return r;
+			}
+			if(pars.xmin > 0.0) if(y1[0] < pars.xmin) {
+				y1[0] = pars.xmin;
+				need_reset = true;
+			}
+			if(pars.ymin > 0.0) if(y1[1] < pars.ymin) {
+				y1[1] = pars.ymin;
+				need_reset = true;
 			}
 		}
 		
@@ -455,7 +640,7 @@ int do_one_run(const params& pars, const double y0[2], double tmax, double dt, b
 		if(fout) fprintf(fout, "%f\t%f\t%f\n", t, y1[0], y1[1]);
 		
 		// calculate the new derivatives, test if they are in the same segment if needed
-		if(cout || cycles_summary || fixed_step) dfunc2(t, y1, dydt, pars);
+		if(cout || cycles_summary || fixed_step) pars.dfunc(t, y1, dydt);
 		if(cout || cycles_summary) {
 			int seg2 = get_segment(dydt);
 			
@@ -482,7 +667,7 @@ int do_one_run(const params& pars, const double y0[2], double tmax, double dt, b
 					if(cycles_summary) break;
 				}
 				
-				if(segment == target_segment) {
+				if((segment == target_segment) && cout) {
 					if(last_t >= 0.0) {
 						double tmp1 = dst2[0] / dst[0];
 						double tmp2 = dst2[1] / dst[1];
@@ -536,8 +721,8 @@ int main(int argc, char **argv) {
 	// decrease of distance after the first cycle, eigenvalues and maximum overshoot
 	int target_segment = 1; // which segment to consider as the target for convergence analysis
 	
-	bool auto_a = false; // adjust the a parameter automatically (only works for the BT and BT_LIN model versions)
-	bool auto_bd = false; // adjust the b and d parameters automatically (only works for the BT and BT_LIN model versions)
+	bool auto_a = false; // adjust the a parameter automatically (only works for the VOLTERRA_LOG and VOLTERRA_LIN model versions)
+	bool auto_bd = false; // adjust the b and d parameters automatically (only works for the VOLTERRA_LOG and VOLTERRA_LIN model versions)
 	
 	bool multi_run = false; // repeated runs with cycles_summary == true
 	double amin, amax, astep = -1.0;
@@ -589,8 +774,8 @@ int main(int argc, char **argv) {
 			pars.d = atof(argv[i+1]);
 			i++;
 			break;
-		case 'e':
-			pars.e = atof(argv[i+1]);
+		case 'g':
+			pars.g = atof(argv[i+1]);
 			i++;
 			break;
 		case 'r':
@@ -616,6 +801,21 @@ int main(int argc, char **argv) {
 			y = atof(argv[i+1]);
 			i++;
 			break;
+		case 'm':
+			switch(argv[i][2]) {
+				case 'x':
+					pars.xmin = atof(argv[i+1]);
+					i++;
+					break;
+				case 'y':
+					pars.ymin = atof(argv[i+1]);
+					i++;
+					break;
+				default:
+					fprintf(stderr, "Unknown parameter: %s!\n", argv[i]);
+					return 1;
+			}
+			break;
 		case 'T':
 			tmax = atof(argv[i+1]);
 			tmax_par = true;
@@ -623,6 +823,10 @@ int main(int argc, char **argv) {
 			break;
 		case 'D':
 			dt = atof(argv[i+1]);
+			i++;
+			break;
+		case 'E':
+			pars.E = atof(argv[i+1]);
 			i++;
 			break;
 		case 'F':
@@ -698,12 +902,13 @@ int main(int argc, char **argv) {
 	if(multi_run) {
 		cycles_summary = true;
 		switch(pars.t) {
-			case params::type::BT:
-			case params::type::BT_LIN:
+			case params::type::VOLTERRA_LOG:
+			case params::type::VOLTERRA_LIN:
 				if((bstep <= 0.0 && astep <= 0.0) || cstep <= 0.0) throw std::runtime_error("Missing parameters!\n");
 				if(bstep > 0.0 && astep > 0.0) throw std::runtime_error("Invalid parameter combination!\n");
 				break;
-			case params::type::SOIL2:
+			case params::type::SOIL_LIN:
+			case params::type::SOIL_LOG:
 				if(astep <= 0.0 || cstep <= 0.0) throw std::runtime_error("Missing parameters!\n");
 				break;
 			default:
@@ -712,8 +917,8 @@ int main(int argc, char **argv) {
 	}
 	else {
 		if(auto_a && auto_bd) throw std::runtime_error("Unsupported parameter combination (either a or b and d must be specified)!\n");
-		if(auto_a) pars.set_auto_a();
-		if(auto_bd) pars.set_auto_bd();
+		if(auto_a) { pars.set_auto_a(); fprintf(stderr, "%f\n", pars.a); }
+		if(auto_bd) { pars.set_auto_bd(); fprintf(stderr, "%f\t%f\n", pars.b, pars.d); }
 	}
 	
 	std::mt19937_64 rng(seed);
@@ -741,8 +946,8 @@ int main(int argc, char **argv) {
 		pars.print_header(stdout, ',', false);
 		fprintf(stdout, "lambda_re,lambda_im,step1,overshoot\n");
 		switch(pars.t) {
-			case params::type::BT:
-			case params::type::BT_LIN:
+			case params::type::VOLTERRA_LOG:
+			case params::type::VOLTERRA_LIN:
 				if(bstep > 0.0) {
 					for(pars.b = bmin; pars.b <= bmax; pars.b += bstep)
 					for(pars.c = cmin; pars.c <= cmax; pars.c += cstep) {
@@ -754,7 +959,8 @@ int main(int argc, char **argv) {
 					break;
 				}
 				else auto_bd = true; // fallthrough in this case
-			case params::type::SOIL2:
+			case params::type::SOIL_LIN:
+			case params::type::SOIL_LOG:
 				{
 					for(pars.a = amin; pars.a <= amax; pars.a += astep)
 					for(pars.c = cmin; pars.c <= cmax; pars.c += cstep) {
@@ -765,6 +971,9 @@ int main(int argc, char **argv) {
 					}
 				}
 				break;
+			default:
+				// note: this is already handled in line 802
+				throw std::runtime_error("Repeated runs not supported for the given model variant!\n");
 		}
 	}
 	else do_one_run(pars, y0, tmax, dt, fixed_step, noise_x, noise_y, discrete_noise, fout, cout,
